@@ -9,7 +9,15 @@ const dist=(a,b)=>{let x=a.charCodeAt(0)-b.charCodeAt(0),y=Number(a[1])-Number(b
 function view(room,side){const p=room.players[side],other=room.players[1-side];return {id:room.id,side,phase:room.phase,turn:room.turn,ready:p.ready,opponentReady:other?.ready||false,ships:p.ships,events:p.events,opponentConnected:!!other,win:room.win};}
 function push(room){room.players.forEach((p,i)=>{if(p)io.to(p.id).emit('state',view(room,i))})}
 function notify(room,side,msg){io.to(room.players[side].id).emit('notice',msg)}
-function makeRoom(){let id;do{id}=String(randomInt(0,100000)).padStart(5,'0')}while(rooms.has(id));return id}
+
+function makeRoom() {
+  let id;
+  do {
+    id = String(randomInt(0, 100000)).padStart(5, '0');
+  } while (rooms.has(id));
+  return id;
+}
+
 io.on('connection',socket=>{
  socket.on('create',(_,cb)=>{let id=makeRoom(),room={id,phase:'setup',turn:0,players:[{id:socket.id,ready:false,ships:{},events:[]},null],win:null};rooms.set(id,room);socket.data.room=id;socket.data.side=0;socket.join(id);cb({ok:true,id});push(room)});
  socket.on('join',({id},cb)=>{let r=rooms.get(String(id));if(!r||r.players[1]||r.phase!=='setup')return cb({ok:false,error:'ルームがないか、満員です'});r.players[1]={id:socket.id,ready:false,ships:{},events:[]};socket.data.room=r.id;socket.data.side=1;socket.join(r.id);cb({ok:true,id:r.id});push(r)});
