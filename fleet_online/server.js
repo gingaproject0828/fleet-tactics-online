@@ -1,29 +1,140 @@
 import express from 'express';
-import {createServer} from 'node:http';
-import {Server} from 'socket.io';
-import {randomInt} from 'node:crypto';
-const app=express(),http=createServer(app),io=new Server(http);app.use(express.static('public'));
-const rooms=new Map(),types={S:3,J:2,K:1},quota={S:1,J:2,K:3};
-const valid=p=>typeof p==='string'&&/^[A-E][1-5]$/.test(p);
-const dist=(a,b)=>{let x=a.charCodeAt(0)-b.charCodeAt(0),y=Number(a[1])-Number(b[1]);return [Math.abs(x),Math.abs(y)]};
-function view(room,side){const p=room.players[side],other=room.players[1-side];return {id:room.id,side,phase:room.phase,turn:room.turn,ready:p.ready,opponentReady:other?.ready||false,ships:p.ships,events:p.events,opponentConnected:!!other,win:room.win};}
-function push(room){room.players.forEach((p,i)=>{if(p)io.to(p.id).emit('state',view(room,i))})}
-function notify(room,side,msg){io.to(room.players[side].id).emit('notice',msg)}
+import { createServer } from 'node:http';
+import { Server } from 'socket.io';
+import { randomInt } from 'node:crypto';
 
+const app = express();
+const http = createServer(app);
+const io = new Server(http);
+app.use(express.static('public'));
+
+const rooms = new Map();
+const hpByType = { S: 3, J: 2, K: 1 };
+const defaultQuotas = [{ S: 1, J: 2, K: 3 }, { S: 1, J: 2, K: 3 }];
+const valid = p => typeof p === 'string' && /^[A-E][1-5]$/.test(p);
+const dist = (a, b) => [Math.abs(a.charCodeAt(0) - b.charCodeAt(0)), Math.abs(Number(a[1]) - Number(b[1]))];
+const total = q => Object.values(q).reduce((a, b) => a + b, 0);
+const freshPlayer = id => ({ id, ready: false, ships: {}, ownLog: [], enemyLog: [] });
 function makeRoom() {
   let id;
-  do {
-    id = String(randomInt(0, 100000)).padStart(5, '0');
-  } while (rooms.has(id));
+  do { id = String(randomInt(0, 100000)).padStart(5, '0'); } while (rooms.has(id));
   return id;
 }
+function view(r, side) {
+  const p = r.players[side], other = r.players[1 - side];
+  return {
+    id: r.id, side, phase: r.phase, turn: r.turn, ready: p.ready,
+    opponentReady: !!other?.ready, opponentConnected: !!other,
+    ships: p.ships, ownLog: p.ownLog, enemyLog: p.enemyLog,
+    win: r.win, quotas: r.quotas, opponentShips: other ? Object.keys(other.ships).length : null,
+    lastAttack: r.lastAttack
+  };
+}
+function push(r) { r.players.forEach((p, i) => { if (p) io.to(p.id).emit('state', view(r, i)); }); }
+function notice(r, side, msg) { if (r.players[side]) io.to(r.players[side].id).emit('notice', msg); }
+function reply(cb, result) { if (typeof cb === 'function') cb(result); }
+function authorized(socket, r) { return r && r.players[socket.data.side]?.id === socket.id; }
+function parseQuota(q) {
+  if (!q || typeof q !== 'object' || Array.isArray(q)) return null;
+  const result = {};
+  for (const t of ['S', 'J', 'K']) {
+    if (!Number.isInteger(q[t]) || q[t] < 0 || q[t] > 5) return null;
+    result[t] = q[t];
+  }
+  return total(result) >= 1 && total(result) <= 25 ? result : null;
+}
 
-io.on('connection',socket=>{
- socket.on('create',(_,cb)=>{let id=makeRoom(),room={id,phase:'setup',turn:0,players:[{id:socket.id,ready:false,ships:{},events:[]},null],win:null};rooms.set(id,room);socket.data.room=id;socket.data.side=0;socket.join(id);cb({ok:true,id});push(room)});
- socket.on('join',({id},cb)=>{let r=rooms.get(String(id));if(!r||r.players[1]||r.phase!=='setup')return cb({ok:false,error:'ルームがないか、満員です'});r.players[1]={id:socket.id,ready:false,ships:{},events:[]};socket.data.room=r.id;socket.data.side=1;socket.join(r.id);cb({ok:true,id:r.id});push(r)});
- socket.on('place',({ships},cb)=>{let r=rooms.get(socket.data.room),s=socket.data.side;if(!r||r.phase!=='setup'||r.players[s]?.id!==socket.id)return cb({ok:false,error:'配置できません'});let entries=Object.entries(ships||{}),counts={S:0,J:0,K:0};for(let [p,t] of entries){if(!valid(p)||!types[t])return cb({ok:false,error:'不正な配置'});counts[t]++}if(Object.keys(quota).some(k=>counts[k]!==quota[k]))return cb({ok:false,error:'S1隻・J2隻・K3隻を配置してください'});r.players[s].ships=Object.fromEntries(entries.map(([p,t])=>[p,{hp:types[t]}]));r.players[s].ready=true;if(r.players.every(p=>p?.ready)){r.phase='play';r.turn=0;r.players.forEach(p=>p.events.push('両者準備完了。対戦開始！'))}cb({ok:true});push(r)});
- socket.on('action',({from,to,kind},cb)=>{let r=rooms.get(socket.data.room),s=socket.data.side;if(!r||r.phase!=='play'||r.turn!==s||r.players[s]?.id!==socket.id)return cb({ok:false,error:'今はあなたのターンではありません'});let me=r.players[s],opp=r.players[1-s];if(!valid(from)||!valid(to)||!me.ships[from])return cb({ok:false,error:'自分の艦を選んでください'});let [a,b]=dist(from,to);if(kind==='move'){if(a+b!==1||me.ships[to])return cb({ok:false,error:'上下左右の空きマスに1マスだけ移動できます'});me.ships[to]=me.ships[from];delete me.ships[from];me.events.push(`${from} → ${to} に移動`);opp.events.push(`相手が${a===1?(from[0]<to[0]?'南':'北'):(Number(from[1])<Number(to[1])?'東':'西')}へ1マス移動`)}else if(kind==='fire'){if(Math.max(a,b)!==1)return cb({ok:false,error:'周囲8マスだけ攻撃できます'});let shots=me.ships[from].hp,target=opp.ships[to];me.events.push(`${to} に${shots}発発射`);opp.events.push(`相手が${to}に${shots}発発射`);if(target){target.hp-=shots;let status=target.hp<=0?'沈没':target.hp===1?'大破':'小破';if(target.hp<=0)delete opp.ships[to];me.events.push(`命中！ ${status}`);opp.events.push(`${to}が被弾！ ${status}`);notify(r,s,`命中！ ${status}`);notify(r,1-s,`${to}が被弾！ ${status}`)}else{let nearest=Math.min(...Object.keys(opp.ships).map(p=>Math.max(...dist(p,to))),99);let result=nearest===1?'危うし':'さざ波';me.events.push(result);opp.events.push(`判定：${result}`);notify(r,s,result)} }else return cb({ok:false,error:'不正な操作'});
- if(Object.keys(opp.ships).length===0){r.phase='ended';r.win=s;me.events.push('勝利！');opp.events.push('敗北')}else r.turn=1-s;cb({ok:true});push(r)});
- socket.on('disconnect',()=>{let r=rooms.get(socket.data.room);if(!r)return;let s=socket.data.side;if(r.players[s]?.id===socket.id){if(r.phase==='play'){r.phase='ended';r.win=1-s}r.players[s]=null;push(r);if(r.players.every(p=>!p))rooms.delete(r.id)}})
+io.on('connection', socket => {
+  socket.on('create', (_, cb) => {
+    if (socket.data.room) return reply(cb, { ok: false, error: 'すでにルームに参加しています' });
+    const id = makeRoom();
+    const r = { id, phase: 'setup', turn: 0, players: [freshPlayer(socket.id), null], win: null,
+      quotas: defaultQuotas.map(q => ({ ...q })), lastAttack: null, seq: 0 };
+    rooms.set(id, r); socket.data.room = id; socket.data.side = 0; socket.join(id);
+    reply(cb, { ok: true, id }); push(r);
+  });
+  socket.on('join', ({ id } = {}, cb) => {
+    if (socket.data.room) return reply(cb, { ok: false, error: 'すでにルームに参加しています' });
+    const r = rooms.get(String(id));
+    if (!r || r.players[1] || r.phase !== 'setup') return reply(cb, { ok: false, error: 'ルームがないか、満員です' });
+    r.players[1] = freshPlayer(socket.id); socket.data.room = r.id; socket.data.side = 1; socket.join(r.id);
+    reply(cb, { ok: true, id: r.id }); push(r);
+  });
+  socket.on('settings', ({ quotas } = {}, cb) => {
+    const r = rooms.get(socket.data.room);
+    if (!authorized(socket, r) || socket.data.side !== 0 || r.phase !== 'setup' || r.players.some(p => p?.ready))
+      return reply(cb, { ok: false, error: '設定は準備完了前のルームオーナーだけが変更できます' });
+    if (!Array.isArray(quotas) || quotas.length !== 2) return reply(cb, { ok: false, error: '設定が不正です' });
+    const parsed = quotas.map(parseQuota);
+    if (parsed.some(q => !q)) return reply(cb, { ok: false, error: '各艦種は0〜5隻、合計1〜25隻にしてください' });
+    r.quotas = parsed; reply(cb, { ok: true }); push(r);
+  });
+  socket.on('place', ({ ships } = {}, cb) => {
+    const r = rooms.get(socket.data.room), s = socket.data.side;
+    if (!authorized(socket, r) || r.phase !== 'setup' || r.players[s].ready)
+      return reply(cb, { ok: false, error: '配置できません' });
+    if (!ships || typeof ships !== 'object' || Array.isArray(ships))
+      return reply(cb, { ok: false, error: '配置が不正です' });
+    const entries = Object.entries(ships), counts = { S: 0, J: 0, K: 0 };
+    for (const [p, t] of entries) {
+      if (!valid(p) || !hpByType[t]) return reply(cb, { ok: false, error: '不正な配置です' });
+      counts[t]++;
+    }
+    if (Object.keys(counts).some(t => counts[t] !== r.quotas[s][t]))
+      return reply(cb, { ok: false, error: '設定された艦数どおりに配置してください' });
+    r.players[s].ships = Object.fromEntries(entries.map(([p, t]) => [p, { hp: hpByType[t] }]));
+    r.players[s].ready = true;
+    if (r.players.every(p => p?.ready)) {
+      r.phase = 'play'; r.turn = 0;
+      r.players.forEach(p => p.ownLog.push('両者準備完了。対戦開始！'));
+    }
+    reply(cb, { ok: true }); push(r);
+  });
+  socket.on('action', ({ from, to, kind } = {}, cb) => {
+    const r = rooms.get(socket.data.room), s = socket.data.side;
+    if (!authorized(socket, r) || r.phase !== 'play' || r.turn !== s)
+      return reply(cb, { ok: false, error: '今はあなたのターンではありません' });
+    const me = r.players[s], opp = r.players[1 - s];
+    if (!opp || !valid(from) || !valid(to) || !me.ships[from])
+      return reply(cb, { ok: false, error: '自分の艦を選んでください' });
+    const [a, b] = dist(from, to);
+    if (kind === 'move') {
+      if (a + b !== 1 || me.ships[to])
+        return reply(cb, { ok: false, error: '上下左右の空きマスに1マスだけ移動できます' });
+      me.ships[to] = me.ships[from]; delete me.ships[from];
+      me.ownLog.push(`${from} → ${to} に移動`);
+      opp.enemyLog.push(`敵艦が${a === 1 ? (from[0] < to[0] ? '南' : '北') : (Number(from[1]) < Number(to[1]) ? '東' : '西')}へ1マス移動`);
+      r.lastAttack = null;
+    } else if (kind === 'fire') {
+      if (Math.max(a, b) !== 1) return reply(cb, { ok: false, error: '周囲8マスだけ攻撃できます' });
+      const shots = me.ships[from].hp, target = opp.ships[to], hit = !!target;
+      r.lastAttack = { seq: ++r.seq, attacker: s, from, to, shots, hit };
+      me.ownLog.push(`${from} → ${to} に魚雷${shots}発発射`);
+      opp.enemyLog.push(`${to} に敵の魚雷${shots}発が着弾`);
+      if (hit) {
+        target.hp -= shots;
+        const status = target.hp <= 0 ? '沈没' : target.hp === 1 ? '大破' : '小破';
+        if (target.hp <= 0) delete opp.ships[to];
+        me.ownLog.push(`命中！ ${status}`); opp.enemyLog.push(`${to} が被弾！ ${status}`);
+        notice(r, s, `命中！ ${status}`); notice(r, 1 - s, `${to} が被弾！ ${status}`);
+      } else {
+        const nearest = Math.min(99, ...Object.keys(opp.ships).map(p => Math.max(...dist(p, to))));
+        const result = nearest === 1 ? '危うし' : 'さざ波';
+        me.ownLog.push(result); opp.enemyLog.push(`判定：${result}`); notice(r, s, result);
+      }
+    } else return reply(cb, { ok: false, error: '不正な操作です' });
+    if (Object.keys(opp.ships).length === 0) {
+      r.phase = 'ended'; r.win = s; me.ownLog.push('勝利！'); opp.enemyLog.push('敗北');
+    } else r.turn = 1 - s;
+    reply(cb, { ok: true }); push(r);
+  });
+  socket.on('disconnect', () => {
+    const r = rooms.get(socket.data.room), s = socket.data.side;
+    if (!authorized(socket, r)) return;
+    if (r.phase === 'play') { r.phase = 'ended'; r.win = 1 - s; }
+    r.players[s] = null; push(r);
+    if (r.players.every(p => !p)) rooms.delete(r.id);
+  });
 });
-http.listen(process.env.PORT||3000,()=>console.log('Fleet online ready'));
+
+http.listen(process.env.PORT || 3000, () => console.log('Fleet Tactics v2 ready'));
